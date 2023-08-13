@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC Signalling Tester</title>
+
+  <script>
+    /*
+        Things that are not the best:
+            - Hardcoded 3rd party stun server
+            - stringifying way too many times everywhere
+    */
+
+    let stunUrl = 'stun:stun3.l.google.com:19302'
+
+    addEventListener('load', () => {
+      document.getElementById('btn-host').addEventListener('click', doHost)
+      document.getElementById('btn-join').addEventListener('click', doJoin)
+      document.getElementById('btn-list').addEventListener('click', doList)
+
+      // Populate an random name for quicker testing
+      document.getElementById('txt-join-client').value = 'Larry' + (Math.random() * 1000).toFixed(0)
+      document.getElementById('txt-host-name').value = 'Some Session ' + (Math.random() * 1000).toFixed(0)
+
+      // Some enter buttons
+      document.getElementById('txt-join-name').addEventListener('keyup', event => {
+        if (event.key === 'Enter') {
+          doJoin()
+        }
+      })
+      document.getElementById('txt-host-name').addEventListener('keyup', event => {
+        if (event.key === 'Enter') {
+          doHost()
+        }
+      })
+    })
+
+    let session_name;
+    let host_secret;
+
+    let clients = []
+
+    /**
+     * Logs a message to the page
+     * @param {string} msg
+     */
+    function log(msg) {
+      let el = document.getElementById('log')
+      el.innerText += msg + '\n'
+
+      // Keep the pre scrolled to the bottom
+      el.scrollTo({ top: el.scrollHeight })
+    }
+
+    /**
+     * Delay the specified number of milliseconds and resolve
+     * @param {number} ms
+     * @returns {Promise<void>}
+     */
+    function delay(ms) {
+      return new Promise((resolve, reject) => setTimeout(resolve, ms))
+    }
+
+    /**
+     * Attaches to an RTCPeerConnection to gather ICE candidates.
+     * Resolves with the array of gathered candidates when we receive an "End of Candidates" message
+     * @param {RTCPeerConnection} connection
+     * @returns {Promise<Array<RTCIceCandidate>>}
+     */
+    function gatherIceCandidates(connection) {
+      let state = connection.iceGatheringState
+
+      // We should attach right away or we could miss some candidates
+      if (state !== 'new') throw new Error('It is probably a bad idea to start gathering ICE candidates after the connection is gathering')
+
+      return new Promise((resolve, reject) => {
+        // We have some goofy sentinel values to signal state changes, sometimes
+        // See https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Connectivity#choosing_a_candidate_pair
+        let candidates = []
+
+        connection.onicecandidate = event => {
+          if (event.candidate === null) {
+            // This one does not need to be sent
+            log('Null EoC message')
+            return
+          }
+
+          log('Received local ICE candidate!')
+          console.log('Got candidate', event.candidate)
+          candidates.push(event.candidate)
+
+          // Empty string is the "end of candidates" message
+          // Supposedly we should send this one too
+          if (event.candidate === '') {
+            log('EoC message')
+          }
+        }
+
+        connection.onicegatheringstatechange = event => {
+          console.log('ICE state change', connection.iceGatheringState)
+
+          if (connection.iceGatheringState === 'complete') {
+            resolve(candidates)
+          }
+        }
+
+        connection.onicecandidateerror = err => {
+          console.error(err)
+          log(`Ice error (non-fatal) ${err.errorCode}: ${err.errorText}`)
+        }
+      })
+
+    }
+
+    async function doList() {
+      log('Searching for sessions')
+
+      let res = await fetch('/list')
+      let sessions = await res.json()
+
+      log('Some available sessions:');
+      for (let session of sessions.slice(0, 10)) {
+        let link = document.createElement('a')
+        link.href = '#'
+        link.innerText = `  ${session}\n`
+        link.onclick = evt => {
+          evt.preventDefault();
+          document.getElementById('txt-join-name').value = session
+          doJoin()
+        }
+        document.getElementById('log').appendChild(link)
+      }
+    }
+
+    async function doHost() {
+      log('Starting up a session')
+
+      let public = document.getElementById('chk-public').checked
+      let session_name = document.getElementById('txt-host-name').value
+
+      let proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      let ws = new WebSocket(`${proto}//${location.host}/host`)
+
+      ws.onclose = () => {
+        log('Host connection closed')
+      }
+
+      ws.onerror = err => {
+        log('Host connection error')
+        console.error(err)
+      }
+
+      ws.onmessage = async msg => {
+        let {
+          session_name: session_name_from_client,
+          client_name,
+          rtc_offer,
+          rtc_candidates: rtc_candidates_from_client,
+        } = JSON.parse(msg.data)
+
+        if (session_name_from_client !== session_name) {
+          log('Client tried to join but wrong session name')
+          return
+        }
+
+        if (clients.has(client_name)) {
+          log('Client tried to join but already exists')
+          return
+        }
+
+        log(`Got join request from ${client_name}`)
+
+        let client = new ClientConnection(client_name, onMessage)
+        clients.set(client_name, client)
+        let rtc_answer = await client.connectToOffer(JSON.parse(rtc_offer))
+        let rtc_candidates = await client.iceGather
+
+        for (let candidate of rtc_candidates_from_client) {
+          await client.onIceCandidates(JSON.parse(candidate))
+        }
+
+        // Respond with our info
+        ws.send(JSON.stringify({
+          client_name,
+          rtc_answer: JSON.stringify(rtc_answer),
+          rtc_candidates: rtc_candidates.map(candidate => JSON.stringify(candidate)),
+        }))
+      }
+
+      await new Promise((resolve, reject) => ws.onopen = resolve)
+
+      // Send initial hosting message
+      ws.send(JSON.stringify({
+        name: session_name,
+      }))
+
+      await navigator.clipboard.writeText(session_name)
+
+      log(`  session_name=${session_name}`)
+      log('  (We copied it to your clipboard)')
+
+      /** @type {Map<string, ClientConnection>} */
+      let clients = new Map()
+
+      /** Handle a message from a client */
+      function onMessage(client, message) {
+        let formatted = `${client.client_name}: ${message}`
+
+        log(formatted)
+
+        // Forward to everyone else
+        for (let otherClient of clients.values()) {
+          if (otherClient === client) continue
+          otherClient.dc?.send(formatted)
+        }
+      }
+
+      attachChat(msg => {
+        let formatted = `Host: ${msg}`
+
+        for (let client of clients.values()) {
+          client.dc?.send(formatted)
+        }
+      })
+    }
+
+    class ClientConnection {
+      constructor(client_name, messageCallback) {
+        this.client_name = client_name
+
+        this.connection = new RTCPeerConnection({
+          iceServers: [{ urls: stunUrl }]
+        })
+
+        this.isConnected = false
+        this.connection.ondatachannel = dc => {
+          this.isConnected = true
+          this.onDataChannel(dc.channel)
+        }
+
+        this.iceGather = gatherIceCandidates(this.connection)
+
+        this.dc = null
+        this.messageCallback = messageCallback
+      }
+
+      /** Connects our connection the given offer, sets up an ICE channel, and returns an answer */
+      async connectToOffer(client_offer) {
+        await this.connection.setRemoteDescription(client_offer)
+        let answer = await this.connection.createAnswer()
+        this.connection.setLocalDescription(answer)
+        return answer
+      }
+
+      async onIceCandidates(candidate) {
+        log(`Got client ICE from ${this.client_name}`)
+        await this.connection.addIceCandidate(candidate)
+      }
+
+      onDataChannel(dc) {
+        log('Got data channel!')
+        dc.send('hello from the server')
+        dc.onmessage = message => this.messageCallback(this, message.data)
+
+        this.dc = dc;
+      }
+    }
+
+    async function doJoin() {
+      let clientConnection = new RTCPeerConnection({
+        iceServers: [{ urls: stunUrl }]
+      })
+
+      let iceGather = gatherIceCandidates(clientConnection);
+
+
+      session_name = document.getElementById('txt-join-name').value
+      let client_name = document.getElementById('txt-join-client').value
+
+      log(`Connecting to ${session_name}`)
+
+      log('  Creating offer')
+
+      let connected = false
+
+      let channel = clientConnection.createDataChannel('main')
+      let channelOpen = new Promise((resolve, reject) => {
+        channel.onopen = () => {
+          resolve()
+          log('Connected!')
+          connected = true
+          channel.send('hello from client')
+
+          // TEST
+          window['channel'] = channel
+        }
+
+        channel.onerror = err => {
+          reject(err)
+        }
+      })
+      channel.onmessage = event => {
+        log(event.data)
+      }
+
+
+      let offer = await clientConnection.createOffer()
+      await clientConnection.setLocalDescription(offer)
+
+      log(offer.sdp)
+
+      // TODO do we need the host offer before we can get candidates?
+
+      let res = await fetch('/join', {
+        method: 'POST',
+        body: JSON.stringify({
+          session_name,
+          client_name,
+          rtc_offer: JSON.stringify(offer),
+          rtc_candidates: (await iceGather).map(c => JSON.stringify(c.toJSON()))
+        }),
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      })
+
+      if (res.status !== 200) {
+        log(`Failed to connect: ${res.statusText}`)
+      }
+
+      let {
+        client_name: client_name_from_host,
+        rtc_answer,
+        rtc_candidates,
+      } = await res.json()
+
+      if (client_name_from_host !== client_name) {
+        log('Host sent us the wrong client name')
+        return
+      }
+
+      log('Got host description, applying')
+
+      await clientConnection.setRemoteDescription(JSON.parse(rtc_answer))
+      for (let candidate of rtc_candidates) {
+        await clientConnection.addIceCandidate(JSON.parse(candidate))
+      }
+
+      await channelOpen
+
+      if (connected) {
+        log('Client side is good to go!')
+        attachChat(msg => channel.send(msg))
+      } else {
+        log('Giving up!')
+      }
+
+    }
+
+    /**
+     * Attach our input control to do some chat over the given channel
+     * @param {(string) => void)} cb
+     */
+    function attachChat(cb) {
+      /** @type {HTMLInputElement} */
+      let el = document.getElementById('chatty')
+      el.disabled = false;
+
+      el.addEventListener('keydown', evt => {
+        if (evt.key === 'Enter') {
+          let msg = el.value
+          el.value = ''
+
+          log(`-> ${msg}`)
+          cb(msg)
+        }
+      })
+
+      el.focus()
+    }
+  </script>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet"
+    integrity="sha384-GLhlTQ8iRABdZLl6O3oVMWSktQOp6b7In1Zl3/Jr59b6EGGoI1aFkw7cmDA6j6gD" crossorigin="anonymous">
+  <style>
+    html,
+    body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      background: midnightblue;
+      color: white;
+    }
+  </style>
+</head>
+
+<body class="d-flex flex-column p-3">
+  <div class="buttons d-flex flex-row mb-3">
+    <div class="button-group me-3 d-flex flex-column">
+      <input type="text" id="txt-host-name" placeholder="Session name" />
+
+      <button id="btn-host" class="btn btn-success">Request new session</button>
+
+      <div class="form-check">
+        <input type="checkbox" id="chk-public" class="form-check-input" />
+        <label for="chk-public" class="form-check-label">Public?</label>
+      </div>
+    </div>
+
+    <div class="button-group me-3 d-flex flex-column">
+      <input type="text" id="txt-join-name" placeholder="Session name to join" autofocus />
+      <input type="text" id="txt-join-client" placeholder="Client Name" />
+      <button class="btn btn-success" id="btn-join">Join session</button>
+    </div>
+
+    <div class="button-group me-3 d-flex flex-column">
+      <button class="btn btn-info" id="btn-list">Search Sessions</button>
+    </div>
+  </div>
+
+  <pre id="log" class="bg-white text-black col"></pre>
+
+  <input id="chatty" type="text" disabled class="mb-3" />
+</body>
+
+</html>
