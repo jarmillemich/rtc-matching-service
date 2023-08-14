@@ -121,7 +121,13 @@
       let res = await fetch('/list')
       let sessions = await res.json()
 
-      log('Some available sessions:');
+      if (!sessions.length) {
+        log('No sessions found')
+        return
+      }
+
+      let serverElements = []
+
       for (let session of sessions.slice(0, 10)) {
         let link = document.createElement('a')
         link.href = '#'
@@ -130,9 +136,17 @@
           evt.preventDefault();
           document.getElementById('txt-join-name').value = session
           doJoin()
+          document.getElementById('session-list').classList.remove('show')
         }
-        document.getElementById('log').appendChild(link)
+
+        let wrapper = document.createElement('li')
+        wrapper.appendChild(link)
+
+        serverElements.push(wrapper)
       }
+
+      document.getElementById('session-list-items').replaceChildren(...serverElements)
+      document.getElementById('session-list').classList.add('show')
     }
 
     async function doHost() {
@@ -400,6 +414,29 @@
       background: midnightblue;
       color: white;
     }
+
+    #session-list {
+      display: none;
+
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+      background-color: darkcyan;
+      padding: 1rem;
+      border-radius: 1rem;
+    }
+
+    ul {
+      margin-bottom: 0;
+    }
+
+    #session-list.show {
+      display: block;
+    }
+
+    #session-list a {
+      color: white;
+    }
   </style>
 </head>
 
@@ -430,6 +467,11 @@
   <pre id="log" class="bg-white text-black col"></pre>
 
   <input id="chatty" type="text" disabled class="mb-3" />
+
+  <div id="session-list">
+    <h3>Session List</h3>
+    <ul id="session-list-items"></ul>
+  </div>
 </body>
 
 </html>
